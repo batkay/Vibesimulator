@@ -1,0 +1,49 @@
+(kicad_pcb
+  (version 20240108)
+  (generator "pcb_simulator")
+  (general (thickness 0.2))
+  (paper "A4")
+  (title_block (title "50 ohm microstrip") (comment 1 "design Z0 50.00 ohm") (comment 2 "eeff 3.394") (comment 3 "width 0.3764 mm"))
+  (layers
+    (0 "F.Cu" signal)
+    (2 "B.Cu" signal)
+    (9 "F.SilkS" user "F.Silkscreen")
+    (11 "B.SilkS" user "B.Silkscreen")
+    (25 "Edge.Cuts" user)
+  )
+  (setup
+    (stackup
+      (layer "F.Cu" (type "copper") (thickness 0.035))
+      (layer "dielectric 1" (type "core") (thickness 0.2) (material "FR4") (epsilon_r 4.5) (loss_tangent 0.02))
+      (layer "B.Cu" (type "copper") (thickness 0.035))
+    )
+  )
+  (net 0 "")
+  (net 1 "GND")
+  (net 2 "SIG")
+  (gr_rect (start -3.0 -4.0) (end 13.0 4.0) (layer "Edge.Cuts") (width 0.05) (fill none))
+  (segment (start 0.0 0) (end 10.0 0) (width 0.376361) (layer "F.Cu") (net 2))
+  (footprint "sim:launch"
+    (layer "F.Cu")
+    (at 0.0 0)
+    (property "Reference" "J1" (at 0 1 0) (layer "F.SilkS"))
+    (pad "1" smd rect (at 0 0) (size 0.8 0.376361) (layers "F.Cu") (net 2 "SIG"))
+  )
+  (footprint "sim:launch"
+    (layer "F.Cu")
+    (at 10.0 0)
+    (property "Reference" "J2" (at 0 1 0) (layer "F.SilkS"))
+    (pad "1" smd rect (at 0 0) (size 0.8 0.376361) (layers "F.Cu") (net 2 "SIG"))
+  )
+  (zone
+    (net 1)
+    (net_name "GND")
+    (layer "B.Cu")
+    (filled_polygon
+      (layer "B.Cu")
+      (pts
+        (xy -3.0 -4.0) (xy 13.0 -4.0) (xy 13.0 4.0) (xy -3.0 4.0)
+      )
+    )
+  )
+)

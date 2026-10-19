@@ -1,0 +1,24 @@
+[project]
+name = "pcb-simulator"
+version = "0.1.0"
+description = "Desktop PCB simulator: KiCad boards, lumped ports, openEMS, S/Z/TDR."
+requires-python = ">=3.11"
+dependencies = [
+    "PySide6>=6.6",
+    "numpy>=1.26",
+    "shapely>=2.0",
+    "scikit-rf>=1.0",
+    "matplotlib>=3.8",
+]
+
+[project.scripts]
+pcb-simulator = "pcb_simulator.__main__:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "slow: runs openEMS (skipped unless a solver Python is configured)",
+]
+
+[tool.setuptools.packages.find]
+include = ["pcb_simulator*"]
