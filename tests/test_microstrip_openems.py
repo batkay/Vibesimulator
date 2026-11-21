@@ -14,7 +14,9 @@ from pcb_simulator.model.kicad import load_kicad_pcb
 from pcb_simulator.model.mesh import MeshSettings
 from pcb_simulator.model.ports import vertical_port_on_pad
 from pcb_simulator.sim.job import prepare, write_job
-from pcb_simulator.sim.postprocess import distance_m, load_results, network, tdr_impedance
+from pcb_simulator.calc.load import load_results
+from pcb_simulator.calc.network import network
+from pcb_simulator.calc.tdr import distance_m, tdr_impedance
 from pcb_simulator.sim.worker import run_directory
 
 

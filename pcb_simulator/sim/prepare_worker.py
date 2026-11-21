@@ -14,7 +14,7 @@ import sys
 import traceback
 from pathlib import Path
 
-from .job import prepare, write_job
+from .job import prepare, prepare_pdn, write_job
 
 
 def _emit(payload: dict) -> None:
@@ -29,17 +29,36 @@ def main(argv: list[str] | None = None) -> int:
     request_path = Path(argv[0])
     try:
         request = pickle.loads(request_path.read_bytes())
-        job, mesh, warnings = prepare(
-            request["board"],
-            request["crop"],
-            request["ports"],
-            request["mesh_settings"],
-            n_freq=int(request["n_freq"]),
-            end_criteria=float(request["end_criteria"]),
-            nr_ts=int(request["nr_ts"]),
-            threads=request["threads"],
-            progress=_emit,
-        )
+        if request.get("kind") == "pdn":
+            job, mesh, warnings = prepare_pdn(
+                request["board"],
+                request["crop"],
+                request["power_net"],
+                request["reference_net"],
+                request["vrm"],
+                request["loads"],
+                request["parts"],
+                request["mesh_settings"],
+                conductivity=float(request["conductivity"]),
+                n_freq=int(request["n_freq"]),
+                end_criteria=float(request["end_criteria"]),
+                nr_ts=int(request["nr_ts"]),
+                threads=request["threads"],
+                progress=_emit,
+            )
+        else:
+            job, mesh, warnings = prepare(
+                request["board"],
+                request["crop"],
+                request["ports"],
+                request["mesh_settings"],
+                n_freq=int(request["n_freq"]),
+                end_criteria=float(request["end_criteria"]),
+                nr_ts=int(request["nr_ts"]),
+                threads=request["threads"],
+                progress=_emit,
+                stop=str(request.get("stop") or "energy"),
+            )
         job_dir = Path(request["job_dir"])
         if job_dir.exists():
             shutil.rmtree(job_dir, ignore_errors=True)

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+
 from PySide6.QtCore import QPointF, QRectF, Qt, Signal
 from PySide6.QtGui import QBrush, QColor, QPainter, QPainterPath, QPen, QPolygonF
 from PySide6.QtWidgets import (
@@ -18,6 +20,7 @@ from PySide6.QtWidgets import (
 from ..model.board import Board
 from ..model.geom import as_polygon
 from ..model.mesh import Mesh, PortBox
+from ..model.ports import SHEET_MM
 
 _COLORS = {
     "F.Cu": "#FF4D4D",
@@ -28,12 +31,57 @@ _COLORS = {
     "B.Cu": "#4D7DFF",
 }
 _FALLBACK = ("#FF9A4D", "#B8FF4D", "#4DFFD2", "#4DA6FF", "#FF4DA6", "#E6E64D")
+_PICK_PX = 8.0
 
 
 def layer_color(name: str, index: int) -> QColor:
     color = QColor(_COLORS.get(name, _FALLBACK[index % len(_FALLBACK)]))
     color.setAlpha(175)
     return color
+
+
+def _heat_color(value: float, lo: float, hi: float) -> QColor:
+    """Red is the low end of the scale. On a voltage overlay that is the larger drop."""
+    if hi <= lo:
+        span = 0.5
+    else:
+        span = (value - lo) / (hi - lo)
+    red = int(40 + 200 * (1.0 - span))
+    blue = int(40 + 200 * span)
+    return QColor(red, 48, blue, 150)
+
+
+class _HeatItem(QGraphicsItem):
+    """One item for the whole PDN overlay. A cell is a colored square, not its own item."""
+
+    def __init__(self, cells: list[tuple[float, float, float, float]]):
+        super().__init__()
+        self.cells = cells
+        self.setZValue(45)
+        self.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+        xs = [cell[0] for cell in cells]
+        ys = [cell[1] for cell in cells]
+        pitches = [cell[2] for cell in cells]
+        self._bounds = QRectF(
+            min(xs),
+            min(ys),
+            max(x + pitch for x, pitch in zip(xs, pitches)) - min(xs),
+            max(y + pitch for y, pitch in zip(ys, pitches)) - min(ys),
+        )
+        values = [cell[3] for cell in cells if cell[3] == cell[3]]
+        self._lo = min(values) if values else 0.0
+        self._hi = max(values) if values else 0.0
+
+    def boundingRect(self) -> QRectF:
+        return self._bounds
+
+    def paint(self, painter: QPainter, option, widget=None) -> None:
+        painter.setPen(QPen(Qt.PenStyle.NoPen))
+        for x, y, pitch, value in self.cells:
+            if value != value:
+                continue
+            painter.setBrush(QBrush(_heat_color(value, self._lo, self._hi)))
+            painter.drawRect(QRectF(x, y, pitch, pitch))
 
 
 class _MeshItem(QGraphicsItem):
@@ -126,13 +174,15 @@ def _polygon(points) -> QPolygonF:
 
 
 class BoardView(QGraphicsView):
-    """Tools: navigate (hover and highlight), crop (drag a rectangle), port (click)."""
+    """Tools: navigate, crop, port, VRM, load, part, and measure."""
 
     status_text = Signal(str)
     crop_rect = Signal(float, float, float, float)
     pad_clicked = Signal(object)
     copper_clicked = Signal(float, float, str)
     net_picked = Signal(str)
+    measure_clicked = Signal(float, float, float, float)
+    component_picked = Signal(object)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -143,8 +193,14 @@ class BoardView(QGraphicsView):
         self.setTransformationAnchor(QGraphicsView.AnchorUnderMouse)
         self.setResizeAnchor(QGraphicsView.AnchorViewCenter)
         self.setDragMode(QGraphicsView.NoDrag)
+        self.setContextMenuPolicy(Qt.ContextMenuPolicy.NoContextMenu)
+        self.viewport().setContextMenuPolicy(Qt.ContextMenuPolicy.NoContextMenu)
         self.board: Board | None = None
         self.ports: list[PortBox] = []
+        self.vrm = None
+        self.loads: list = []
+        self.parts: list = []
+        self._overlay_cells: list | None = None
         self.mesh: Mesh | None = None
         self.visible_layers: set[str] | None = None
         self.highlight_net: str = ""
@@ -162,9 +218,17 @@ class BoardView(QGraphicsView):
         self._port_hot: QGraphicsEllipseItem | None = None
         self._port_line: QGraphicsLineItem | None = None
         self._port_halo: QGraphicsLineItem | None = None
+        self._port_sheet: QGraphicsRectItem | None = None
+        self._measure_anchor: tuple[float, float] | None = None
+        self._measurements: list[tuple[list[tuple[float, float]], str]] = []
+        self._measure_items: list = []
+        self._measure_preview: list = []
+        self._probe_marks: list[tuple[float, float, str]] = []
+        self._probe_items: list = []
+        self._selected: tuple | None = None
         self._copper_tree = None
         self._copper_geoms: list = []
-        self._copper_meta: list[tuple[str, str]] = []
+        self._copper_meta: list[tuple[str, str, str]] = []
         self._pad_tree = None
         self._pad_geoms: list = []
         self._pad_items: list = []
@@ -177,14 +241,30 @@ class BoardView(QGraphicsView):
             self._rubber = None
         if tool != "port":
             self.set_two_click(False)
-        self.setCursor(Qt.CrossCursor if tool in {"crop", "port"} else Qt.ArrowCursor)
+        self.setCursor(Qt.CrossCursor if tool in {"crop", "port", "vrm", "load", "part", "measure"} else Qt.ArrowCursor)
+        if tool != "measure":
+            self._measure_anchor = None
+            self._clear_measure_preview()
 
     def set_two_click(self, enabled: bool) -> None:
         """Two-click placement draws the first point, then a line that follows the cursor."""
         self._two_click_mode = enabled
         self._clear_port_preview()
 
+    def cancel_gesture(self) -> None:
+        """Drop a half-drawn crop or a line that is following the cursor. The tool stays."""
+        self._dragging = False
+        if self._rubber is not None:
+            if self._rubber.scene() is not None:
+                self.scene().removeItem(self._rubber)
+            self._rubber = None
+        self._measure_anchor = None
+        self._clear_measure_preview()
+        self._clear_port_preview()
+
     def set_board(self, board: Board) -> None:
+        self._selected = None
+        self._measurements = []
         self.board = board
         self.mesh = None
         self.region_points = None
@@ -204,6 +284,23 @@ class BoardView(QGraphicsView):
     def set_ports(self, ports: list[PortBox]) -> None:
         self.ports = list(ports)
         self.rebuild()
+
+    def set_pdn(self, vrm, loads, parts) -> None:
+        self.vrm = vrm
+        self.loads = list(loads)
+        self.parts = list(parts)
+        self.rebuild()
+
+    def set_overlay(self, cells) -> None:
+        """Power-net voltage or current-density squares. None clears the overlay."""
+        self._overlay_cells = list(cells) if cells else None
+        self._replace_overlay()
+
+    def begin_span_preview(self, x: float, y: float) -> None:
+        """Mark the first pad of a two-click part. The line follows the cursor."""
+        self._two_click_mode = True
+        self._port_anchor = (x, y)
+        self._show_port_preview((x, y), (x, y))
 
     def set_region(self, points: list[tuple[float, float]] | None) -> None:
         self.region_points = points
@@ -236,14 +333,19 @@ class BoardView(QGraphicsView):
     def rebuild(self) -> None:
         # Rubber-band state does not survive a scene clear.
         anchor = self._port_anchor
+        measure_anchor = self._measure_anchor
         self._rubber = None
         self._dragging = False
         self._forget_port_preview_items()
+        self._measure_preview = []
+        self._measure_items = []
+        self._probe_items = []
         self.scene().clear()
         board = self.board
         self._index_hits(board)
         if board is None:
             self._port_anchor = None
+            self._measure_anchor = None
             return
         self._draw_copper(board)
         self._draw_vias(board)
@@ -252,9 +354,16 @@ class BoardView(QGraphicsView):
         if self.mesh is not None and len(self.mesh.x) >= 2 and len(self.mesh.y) >= 2:
             self.scene().addItem(_MeshItem(self.mesh))
         self._draw_ports()
+        self._draw_pdn_marks()
+        self._replace_overlay()
+        self._draw_measurement()
+        self._draw_probe()
         if anchor is not None and self._two_click_mode:
             self._port_anchor = anchor
             self._show_port_preview(anchor, anchor)
+        if measure_anchor is not None and self._tool == "measure":
+            self._measure_anchor = measure_anchor
+            self._show_measure_preview(measure_anchor, measure_anchor)
 
     def _shown(self, name: str) -> bool:
         return self.visible_layers is None or name in self.visible_layers
@@ -325,46 +434,129 @@ class BoardView(QGraphicsView):
         self.scene().addItem(item)
 
     def _draw_ports(self) -> None:
-        for port in self.ports:
+        for index, port in enumerate(self.ports):
             x0, y0, _z0 = port.start
             x1, y1, _z1 = port.stop
             if port.marks:
                 (mx0, my0), (mx1, my1) = port.marks
             else:
                 mx0, my0, mx1, my1 = x0, y0, x1, y1
+            chosen = self._selected == ("port", index)
+            color = QColor("#ffd45a") if chosen else QColor("#d6ffe6")
+            ink = QColor("#2a2108") if chosen else QColor("#06210f")
+            identity = ("port", index)
+
+            def tag(item, identity=identity, chosen=chosen) -> None:
+                item.setData(0, "port")
+                item.setData(1, identity)
+                if chosen:
+                    item.setData(2, "selected")
+                _pass_clicks(item)
+
             if abs(x1 - x0) > 0.02 and abs(y1 - y0) > 0.02:
                 sheet = QGraphicsRectItem(_scene_rect(x0, y0, x1, y1))
-                sheet.setPen(_cosmetic(QColor("#d6ffe6"), 2))
-                sheet.setBrush(QBrush(QColor(125, 255, 179, 70)))
+                sheet.setPen(_cosmetic(color, 2))
+                sheet.setBrush(QBrush(QColor(255, 212, 90, 90) if chosen else QColor(125, 255, 179, 70)))
                 sheet.setZValue(60)
-                sheet.setData(0, "port")
-                _pass_clicks(sheet)
+                tag(sheet)
                 self.scene().addItem(sheet)
             halo = QGraphicsLineItem(mx0, my0, mx1, my1)
-            halo.setPen(_cosmetic(QColor("#06210f"), 5))
+            halo.setPen(_cosmetic(ink, 5))
             halo.setZValue(60)
-            halo.setData(0, "port")
-            _pass_clicks(halo)
+            tag(halo)
             self.scene().addItem(halo)
             line = QGraphicsLineItem(mx0, my0, mx1, my1)
-            line.setPen(_cosmetic(QColor("#d6ffe6"), 2))
+            line.setPen(_cosmetic(color, 3 if chosen else 2))
             line.setZValue(61)
-            line.setData(0, "port")
-            _pass_clicks(line)
+            tag(line)
             self.scene().addItem(line)
             for x, y in ((mx0, my0), (mx1, my1)):
-                dot = _screen_dot(x, y, 4.5, QColor("#7dffb3"), QColor("#06210f"))
+                dot = _screen_dot(x, y, 4.5, color, ink)
                 dot.setZValue(62)
-                dot.setData(0, "port")
-                _pass_clicks(dot)
+                tag(dot)
                 self.scene().addItem(dot)
             label = QGraphicsSimpleTextItem(port.name if not port.net else f"{port.name}  {port.net}")
-            label.setBrush(QBrush(QColor("#e8ffe8")))
+            label.setBrush(QBrush(color))
             label.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIgnoresTransformations, True)
-            _pass_clicks(label)
+            tag(label)
             label.setPos((mx0 + mx1) / 2, (my0 + my1) / 2)
             label.setZValue(63)
             self.scene().addItem(label)
+
+    def _draw_pdn_marks(self) -> None:
+        if self.vrm is not None:
+            self._draw_terminal(self.vrm, f"{self.vrm.name}  {self.vrm.volts:g} V", QColor("#ffb020"), "vrm")
+        for load in self.loads:
+            self._draw_terminal(load, f"{load.name}  {load.amps:g} A", QColor("#7ec8ff"), "load")
+        for part in self.parts:
+            self._draw_part(part)
+
+    def _draw_terminal(self, term, text: str, color: QColor, kind: str) -> None:
+        x, y = float(term.x), float(term.y)
+        gx = term.gx
+        gy = term.gy
+        if gx is not None and gy is not None and (abs(gx - x) > 1e-4 or abs(gy - y) > 1e-4):
+            line = QGraphicsLineItem(x, y, float(gx), float(gy))
+            line.setPen(_cosmetic(color, 2))
+            line.setZValue(68)
+            line.setData(0, kind)
+            _pass_clicks(line)
+            self.scene().addItem(line)
+            ground = _screen_dot(float(gx), float(gy), 4.5, color, QColor("#1a1408"))
+            ground.setZValue(69)
+            ground.setData(0, kind)
+            _pass_clicks(ground)
+            self.scene().addItem(ground)
+        dot = _screen_dot(x, y, 6.0, color, QColor("#1a1408"))
+        dot.setZValue(70)
+        dot.setData(0, kind)
+        _pass_clicks(dot)
+        self.scene().addItem(dot)
+        label = QGraphicsSimpleTextItem(text)
+        label.setBrush(QBrush(QColor("#fff6e0")))
+        label.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIgnoresTransformations, True)
+        _pass_clicks(label)
+        label.setPos(x, y)
+        label.setZValue(71)
+        label.setData(0, kind)
+        self.scene().addItem(label)
+
+    def _draw_part(self, part) -> None:
+        line = QGraphicsLineItem(part.ax, part.ay, part.bx, part.by)
+        line.setPen(_cosmetic(QColor("#d0b0ff"), 2))
+        line.setZValue(68)
+        line.setData(0, "part")
+        _pass_clicks(line)
+        self.scene().addItem(line)
+        for x, y in ((part.ax, part.ay), (part.bx, part.by)):
+            dot = _screen_dot(x, y, 4.5, QColor("#d0b0ff"), QColor("#1a1024"))
+            dot.setZValue(69)
+            dot.setData(0, "part")
+            _pass_clicks(dot)
+            self.scene().addItem(dot)
+        bits = [part.name]
+        if part.r_ohm:
+            bits.append(f"{part.r_ohm:g} Ω")
+        if part.l_nh:
+            bits.append(f"{part.l_nh:g} nH")
+        if part.c_nf:
+            bits.append(f"{part.c_nf:g} nF")
+        label = QGraphicsSimpleTextItem("  ".join(bits))
+        label.setBrush(QBrush(QColor("#f3e8ff")))
+        label.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIgnoresTransformations, True)
+        _pass_clicks(label)
+        label.setPos((part.ax + part.bx) / 2, (part.ay + part.by) / 2)
+        label.setZValue(71)
+        label.setData(0, "part")
+        self.scene().addItem(label)
+
+    def _replace_overlay(self) -> None:
+        scene = self.scene()
+        for item in list(scene.items()):
+            if isinstance(item, _HeatItem):
+                scene.removeItem(item)
+        if self._overlay_cells:
+            scene.addItem(_HeatItem(self._overlay_cells))
 
     def _board_rect(self) -> QRectF | None:
         board = self.board
@@ -405,7 +597,7 @@ class BoardView(QGraphicsView):
             if geom is None:
                 continue
             geoms.append(geom)
-            meta.append((poly.layer, poly.net))
+            meta.append((poly.layer, poly.net, poly.kind))
         self._copper_geoms = geoms
         self._copper_meta = meta
         if geoms:
@@ -446,7 +638,7 @@ class BoardView(QGraphicsView):
         best: tuple[tuple[int, int], str, str] | None = None
         for index in self._copper_tree.query(point):
             index = int(index)
-            layer, net = self._copper_meta[index]
+            layer, net, _kind = self._copper_meta[index]
             if skip_hidden and not self._shown(layer):
                 continue
             if not self._copper_geoms[index].covers(point):
@@ -471,12 +663,38 @@ class BoardView(QGraphicsView):
         found = self._copper_under(x, y, skip_hidden=False)
         return found[1] if found is not None else ""
 
+    def trace_net_at(self, x: float, y: float) -> str:
+        """Net of a trace or pad under the point. A pour alone is not a trace."""
+        if self.board is not None and self._copper_tree is not None:
+            from shapely.geometry import Point
+
+            point = Point(x, y)
+            names = self.board.copper_names_top_to_bottom()
+            rank = {name: index for index, name in enumerate(names)}
+            best: tuple[tuple[int, int], str] | None = None
+            for index in self._copper_tree.query(point):
+                index = int(index)
+                layer, net, kind = self._copper_meta[index]
+                if kind == "zone" or not net:
+                    continue
+                if not self._copper_geoms[index].covers(point):
+                    continue
+                key = (rank.get(layer, len(names)), index)
+                if best is None or key < best[0]:
+                    best = (key, net)
+            if best is not None:
+                return best[1]
+        pad = self.pad_at(x, y)
+        if pad is not None and pad.net:
+            return pad.net
+        return ""
+
     def wheelEvent(self, event) -> None:
         factor = 1.15 if event.angleDelta().y() > 0 else 1 / 1.15
         self.scale(factor, factor)
 
     def mousePressEvent(self, event) -> None:
-        if event.button() == Qt.MiddleButton:
+        if event.button() == Qt.RightButton:
             self._pan = True
             self._pan_pos = event.position().toPoint()
             event.accept()
@@ -505,6 +723,12 @@ class BoardView(QGraphicsView):
             return
         if self._port_anchor is not None:
             self._show_port_preview(self._port_anchor, model)
+        if self._tool == "measure" and self._measure_anchor is not None:
+            self._show_measure_preview(self._measure_anchor, model)
+            length = math.dist(self._measure_anchor, model)
+            self.status_text.emit(f"{length:.2f} mm straight")
+            event.accept()
+            return
         x, y = model
         net = self.net_at(x, y)
         layer = self.layer_at(x, y) if net or self.board else ""
@@ -515,7 +739,7 @@ class BoardView(QGraphicsView):
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event) -> None:
-        if event.button() == Qt.MiddleButton and self._pan:
+        if event.button() == Qt.RightButton and self._pan:
             self._pan = False
             event.accept()
             return
@@ -535,11 +759,13 @@ class BoardView(QGraphicsView):
             x, y = self._model_pos(event)
             if self._two_click_mode:
                 # The cursor is the port. A pad under it must not replace the click with the pad center.
+                # A failed second click keeps the first point. The handler clears it when the port is placed.
                 if self._port_anchor is None:
-                    self._port_anchor = (x, y)
-                    self._show_port_preview((x, y), (x, y))
+                    anchor = (x, y)
+                    self._port_anchor = anchor
                 else:
-                    self._clear_port_preview()
+                    anchor = self._port_anchor
+                self._show_port_preview(anchor, (x, y))
                 self.copper_clicked.emit(x, y, self.layer_at(x, y))
                 event.accept()
                 return
@@ -550,8 +776,37 @@ class BoardView(QGraphicsView):
                 self.copper_clicked.emit(x, y, self.layer_at(x, y))
             event.accept()
             return
+        if event.button() == Qt.LeftButton and self._tool in {"vrm", "load", "part"}:
+            x, y = self._model_pos(event)
+            pad = self.pad_at(x, y)
+            if pad is not None:
+                self.pad_clicked.emit(pad)
+            else:
+                self.copper_clicked.emit(x, y, self.layer_at(x, y))
+            event.accept()
+            return
+        if event.button() == Qt.LeftButton and self._tool == "measure":
+            x, y = self._model_pos(event)
+            if self._measure_anchor is None:
+                # The finished line stays until the second click replaces it, or Delete removes it.
+                self._measure_anchor = (x, y)
+                self._show_measure_preview((x, y), (x, y))
+            else:
+                start = self._measure_anchor
+                self._measure_anchor = None
+                self._clear_measure_preview()
+                self.measure_clicked.emit(start[0], start[1], x, y)
+            event.accept()
+            return
         if event.button() == Qt.LeftButton and self._tool == "navigate":
             x, y = self._model_pos(event)
+            hit = self.component_at(x, y)
+            if hit is not None:
+                self.component_picked.emit(hit)
+                event.accept()
+                return
+            if self._selected is not None:
+                self.component_picked.emit(None)
             net = self.net_at(x, y)
             if net:
                 self.net_picked.emit(net)
@@ -564,10 +819,11 @@ class BoardView(QGraphicsView):
         self._port_hot = None
         self._port_line = None
         self._port_halo = None
+        self._port_sheet = None
 
     def _clear_port_preview(self) -> None:
         self._port_anchor = None
-        for item in (self._port_mark, self._port_hot, self._port_line, self._port_halo):
+        for item in (self._port_mark, self._port_hot, self._port_line, self._port_halo, self._port_sheet):
             if item is not None and item.scene() is not None:
                 item.scene().removeItem(item)
         self._forget_port_preview_items()
@@ -596,10 +852,209 @@ class BoardView(QGraphicsView):
             self._port_hot.setData(0, "port-preview")
             _pass_clicks(self._port_hot)
             self.scene().addItem(self._port_hot)
+            half = SHEET_MM / 2.0
+            self._port_sheet = QGraphicsRectItem(_scene_rect(anchor[0] - half, anchor[1] - half, anchor[0] + half, anchor[1] + half))
+            self._port_sheet.setPen(_cosmetic(QColor("#ffd45a"), 1))
+            self._port_sheet.setBrush(QBrush(QColor(255, 212, 90, 70)))
+            self._port_sheet.setZValue(79)
+            self._port_sheet.setData(0, "port-preview")
+            _pass_clicks(self._port_sheet)
+            self.scene().addItem(self._port_sheet)
         self._port_mark.setPos(anchor[0], anchor[1])
         self._port_hot.setPos(end[0], end[1])
         self._port_halo.setLine(anchor[0], anchor[1], end[0], end[1])
         self._port_line.setLine(anchor[0], anchor[1], end[0], end[1])
+
+    def selected(self) -> tuple | None:
+        return self._selected
+
+    def set_selected(self, which: tuple | None) -> None:
+        if which == self._selected:
+            return
+        self._selected = which
+        self._redraw_selection()
+
+    def component_at(self, x: float, y: float) -> tuple | None:
+        """The port or measurement under a click, or None. The pick is in screen pixels."""
+        if self.viewport().width() < 2 or self.viewport().height() < 2:
+            return None
+        px, py = self._pixel_xy(x, y)
+        best: tuple | None = None
+        best_d = _PICK_PX
+        for index, port in enumerate(self.ports):
+            dist = self._port_pick_distance(x, y, px, py, port)
+            if dist <= best_d:
+                best = ("port", index)
+                best_d = dist
+        for index, (path, _label) in enumerate(self._measurements):
+            if len(path) < 2:
+                continue
+            dist = self._path_pick_distance(px, py, path)
+            if dist <= best_d:
+                best = ("measure", index)
+                best_d = dist
+        return best
+
+    def _pixel_xy(self, x: float, y: float) -> tuple[float, float]:
+        point = self.mapFromScene(self.model_to_scene(x, y))
+        return (float(point.x()), float(point.y()))
+
+    def _port_pick_distance(self, x: float, y: float, px: float, py: float, port: PortBox) -> float:
+        if port.marks:
+            (ax, ay), (bx, by) = port.marks
+        else:
+            ax, ay = port.start[0], port.start[1]
+            bx, by = port.stop[0], port.stop[1]
+        dist = self._dist_segment(px, py, ax, ay, bx, by)
+        x0, y0 = port.start[0], port.start[1]
+        x1, y1 = port.stop[0], port.stop[1]
+        if abs(x1 - x0) > 0.02 and abs(y1 - y0) > 0.02:
+            left, right = min(x0, x1), max(x0, x1)
+            top, bottom = min(y0, y1), max(y0, y1)
+            if left <= x <= right and top <= y <= bottom:
+                return 0.0
+            dist = min(
+                dist,
+                self._dist_segment(px, py, left, top, right, top),
+                self._dist_segment(px, py, right, top, right, bottom),
+                self._dist_segment(px, py, right, bottom, left, bottom),
+                self._dist_segment(px, py, left, bottom, left, top),
+            )
+        return dist
+
+    def _path_pick_distance(self, px: float, py: float, path: list[tuple[float, float]]) -> float:
+        dist = min(
+            self._dist_segment(px, py, path[index][0], path[index][1], path[index + 1][0], path[index + 1][1])
+            for index in range(len(path) - 1)
+        )
+        mid = path[len(path) // 2]
+        anchor = self._pixel_xy(mid[0], mid[1])
+        return min(dist, math.hypot(px - anchor[0], py - anchor[1]))
+
+    def _dist_segment(self, px: float, py: float, ax: float, ay: float, bx: float, by: float) -> float:
+        a = self._pixel_xy(ax, ay)
+        b = self._pixel_xy(bx, by)
+        vx, vy = b[0] - a[0], b[1] - a[1]
+        length2 = vx * vx + vy * vy
+        if length2 < 1e-6:
+            return math.hypot(px - a[0], py - a[1])
+        t = ((px - a[0]) * vx + (py - a[1]) * vy) / length2
+        t = min(max(t, 0.0), 1.0)
+        return math.hypot(px - (a[0] + vx * t), py - (a[1] + vy * t))
+
+    def _redraw_selection(self) -> None:
+        if self.board is None:
+            self._draw_measurement()
+            return
+        self.rebuild()
+
+    def measurements(self) -> list[tuple[list[tuple[float, float]], str]]:
+        return self._measurements
+
+    def add_measurement(self, path: list[tuple[float, float]], label: str) -> None:
+        self._measurements.append((list(path), label))
+        self._selected = ("measure", len(self._measurements) - 1)
+        self._redraw_selection()
+
+    def clear_measurements(self) -> None:
+        self._measurements = []
+        if self._selected is not None and self._selected[0] == "measure":
+            self._selected = None
+        self._redraw_selection()
+
+    def remove_measurement(self, index: int) -> None:
+        if index < 0 or index >= len(self._measurements):
+            return
+        del self._measurements[index]
+        selected = self._selected
+        if selected is not None and selected[0] == "measure":
+            chosen = int(selected[1])
+            if chosen == index:
+                self._selected = None
+            elif chosen > index:
+                self._selected = ("measure", chosen - 1)
+        self._redraw_selection()
+
+    def set_probe(self, marks: list[tuple[float, float, str]] | None) -> None:
+        self._probe_marks = list(marks or [])
+        self._draw_probe()
+
+    def _draw_measurement(self) -> None:
+        for item in self._measure_items:
+            if item.scene() is not None:
+                item.scene().removeItem(item)
+        self._measure_items = []
+        for index, (path, label) in enumerate(self._measurements):
+            if len(path) < 2:
+                continue
+            painter = QPainterPath()
+            painter.moveTo(path[0][0], path[0][1])
+            for x, y in path[1:]:
+                painter.lineTo(x, y)
+            chosen = self._selected == ("measure", index)
+            color = QColor("#ffd45a") if chosen else QColor("#f4f1e8")
+            item = QGraphicsPathItem(painter)
+            item.setPen(_cosmetic(color, 3 if chosen else 2))
+            item.setZValue(84)
+            item.setData(1, ("measure", index))
+            if chosen:
+                item.setData(2, "selected")
+            _pass_clicks(item)
+            self.scene().addItem(item)
+            self._measure_items.append(item)
+            if not label:
+                continue
+            mid = path[len(path) // 2]
+            text = QGraphicsSimpleTextItem(label)
+            text.setBrush(QBrush(color))
+            text.setData(1, ("measure", index))
+            text.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIgnoresTransformations, True)
+            text.setPos(mid[0], mid[1])
+            text.setZValue(85)
+            _pass_clicks(text)
+            self.scene().addItem(text)
+            self._measure_items.append(text)
+
+    def _draw_probe(self) -> None:
+        for item in self._probe_items:
+            if item.scene() is not None:
+                item.scene().removeItem(item)
+        self._probe_items = []
+        for x, y, caption in self._probe_marks:
+            dot = _screen_dot(x, y, 6.0, QColor("#ffd45a"), QColor("#2a2108"))
+            dot.setZValue(88)
+            _pass_clicks(dot)
+            self.scene().addItem(dot)
+            self._probe_items.append(dot)
+            text = QGraphicsSimpleTextItem(caption)
+            text.setBrush(QBrush(QColor("#ffd45a")))
+            text.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIgnoresTransformations, True)
+            text.setPos(x, y)
+            text.setZValue(89)
+            _pass_clicks(text)
+            self.scene().addItem(text)
+            self._probe_items.append(text)
+
+    def _clear_measure_preview(self) -> None:
+        for item in self._measure_preview:
+            if item.scene() is not None:
+                item.scene().removeItem(item)
+        self._measure_preview = []
+
+    def _show_measure_preview(self, anchor: tuple[float, float], end: tuple[float, float]) -> None:
+        if not self._measure_preview:
+            line = QGraphicsLineItem()
+            line.setPen(_cosmetic(QColor("#f4f1e8"), 2))
+            line.setZValue(84)
+            _pass_clicks(line)
+            self.scene().addItem(line)
+            dot = _screen_dot(anchor[0], anchor[1], 4.5, QColor("#f4f1e8"), QColor("#20241f"))
+            dot.setZValue(85)
+            _pass_clicks(dot)
+            self.scene().addItem(dot)
+            self._measure_preview = [line, dot]
+        self._measure_preview[0].setLine(anchor[0], anchor[1], end[0], end[1])
+        self._measure_preview[1].setPos(anchor[0], anchor[1])
 
     def _update_rubber(self, end: tuple[float, float]) -> None:
         rect = _scene_rect(self._drag_start[0], self._drag_start[1], end[0], end[1])

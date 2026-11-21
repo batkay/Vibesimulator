@@ -1,1 +1,1 @@
-"""Solver job, openEMS worker, and S/Z/TDR postprocess. No GUI imports."""
+"""Solver job and openEMS worker. Calculated results live in pcb_simulator.calc. No GUI imports."""

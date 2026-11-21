@@ -340,15 +340,63 @@ def polygon_parts(geom: BaseGeometry) -> list[tuple[list[tuple[float, float]], l
     return result
 
 
-def solid_triangles(points: list[tuple[float, float]], holes: list[list[tuple[float, float]]]) -> list[list[tuple[float, float]]]:
-    """Break a polygon with holes into triangles CSXCAD can store as plain polygons."""
+def solid_triangles(
+    points: list[tuple[float, float]],
+    holes: list[list[tuple[float, float]]],
+    _depth: int = 0,
+) -> list[list[tuple[float, float]]]:
+    """Simple polygons CSXCAD can store. A holed pour is clipped to itself.
+
+    Unconstrained Delaunay only checks the triangle center. That center can sit
+    in the pour while the triangle covers a clearance and the trace inside it,
+    and the piece is stored as the same metal as the trace. Clipping drops the
+    part that left the pour.
+    """
     if not holes:
         return [points]
+    if _depth >= 8:
+        return []
     poly = as_polygon(points, holes)
     if poly is None:
-        return [points]
-    tris = []
+        return []
+    pieces: list[list[tuple[float, float]]] = []
     for tri in triangulate(poly):
-        if poly.contains(tri.representative_point()) and tri.area > 1e-12:
-            tris.append([(float(x), float(y)) for x, y in list(tri.exterior.coords)[:-1]])
-    return tris or [points]
+        if tri.is_empty or tri.area <= 1e-12 or not poly.intersects(tri):
+            continue
+        if poly.covers(tri):
+            _append_ring(pieces, list(tri.exterior.coords)[:-1])
+            continue
+        _append_geom(tri.intersection(poly), pieces, _depth)
+    return pieces
+
+
+def _append_geom(geom: BaseGeometry, pieces: list[list[tuple[float, float]]], depth: int) -> None:
+    if geom.is_empty:
+        return
+    kind = geom.geom_type
+    if kind in ("MultiPolygon", "GeometryCollection"):
+        for part in geom.geoms:
+            _append_geom(part, pieces, depth)
+        return
+    if kind != "Polygon" or geom.area <= 1e-12:
+        return
+    if geom.interiors:
+        ring = [(float(x), float(y)) for x, y in list(geom.exterior.coords)[:-1]]
+        holes = [[(float(x), float(y)) for x, y in list(hole.coords)[:-1]] for hole in geom.interiors]
+        for piece in solid_triangles(ring, holes, depth + 1):
+            _append_ring(pieces, piece)
+        return
+    _append_ring(pieces, list(geom.exterior.coords)[:-1])
+
+
+def _append_ring(pieces: list[list[tuple[float, float]]], coords) -> None:
+    ring: list[tuple[float, float]] = []
+    for x, y in coords:
+        point = (float(x), float(y))
+        if ring and abs(ring[-1][0] - point[0]) < 1e-9 and abs(ring[-1][1] - point[1]) < 1e-9:
+            continue
+        ring.append(point)
+    if len(ring) >= 2 and abs(ring[0][0] - ring[-1][0]) < 1e-9 and abs(ring[0][1] - ring[-1][1]) < 1e-9:
+        ring.pop()
+    if len(ring) >= 3:
+        pieces.append(ring)

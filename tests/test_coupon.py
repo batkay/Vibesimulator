@@ -29,6 +29,10 @@ def test_coupon_ports_and_mesh_stay_under_the_gate(tmp_path: Path):
     )
     assert [port["exc_dir"] for port in job["ports"]] == ["z", "z"]
     assert mesh.cell_count < 500_000
+    assert any((layer.loss_tangent or 0) > 0 for layer in board.dielectrics())
+    assert job["materials"]
+    assert all(material["kappa"] == 0.0 for material in job["materials"])
+    assert any(material.get("debye") for material in job["materials"])
 
 
 def test_prepare_worker_writes_the_job_outside_the_gui(tmp_path: Path):

@@ -3,9 +3,9 @@
 Lines are millimeters in the same frame as the board. Cell counts are the
 number of gaps between lines.
 
-The background cell is a fraction of a wavelength. A trace is refined across
-its width; along its length, and in open space, the cell stays at that
-background size. With the default lattice, every copper edge snaps to one
+The background cell is a tenth of a wavelength at 5 GHz. The source f max
+does not change it. A trace is refined across its width; along its length,
+and in open space, the cell stays at that background size. With the default lattice, every copper edge snaps to one
 pitch so a pad field cannot draw a private line at every corner. Pour
 outlines are not seeded vertex by vertex, because a Cartesian line runs the
 full width of the region. Z follows each dielectric slab. A trace-width cell
@@ -26,6 +26,8 @@ C0 = 299_792_458.0
 @dataclass
 class MeshSettings:
     f_max_hz: float = 5e9
+    # Open-space cell. The source bandwidth in f_max_hz does not resize the mesh.
+    mesh_f_hz: float = 5e9
     cells_per_wavelength: int = 10
     cells_per_feature: int = 2
     # Finest cell, in Z and on the exact-edge path. The copper lattice never goes below this.
@@ -36,6 +38,9 @@ class MeshSettings:
     z_cells_per_dielectric: int = 4
     pml_cells: int = 8
     air_cells: int = 2
+    # "pml" keeps the absorber. "mur" is the thin first-order wall. Direct
+    # MeshSettings() stays PML so a caller that does not name a wall is unchanged.
+    boundary: str = "pml"
 
 
 @dataclass
@@ -95,9 +100,10 @@ class Mesh:
 
 
 def _wavelength_dx(board: Board, settings: MeshSettings) -> float:
+    """Open-space cell. Uses mesh_f_hz, which stays at 5 GHz when f max changes."""
     eps = max((d.eps_r or 1.0) for d in board.dielectrics()) if board.dielectrics() else board.top_eps()
     eps = max(eps, 1.0)
-    lam_mm = (C0 / settings.f_max_hz) / math.sqrt(eps) * 1e3
+    lam_mm = (C0 / settings.mesh_f_hz) / math.sqrt(eps) * 1e3
     return max(lam_mm / max(settings.cells_per_wavelength, 1), 1e-4)
 
 
@@ -149,12 +155,12 @@ def build_mesh(
     ports: list[PortBox],
     settings: MeshSettings,
 ) -> Mesh:
-    if settings.f_max_hz <= 0:
-        raise ValueError("f_max must be positive")
+    if settings.mesh_f_hz <= 0:
+        raise ValueError("mesh frequency must be positive")
     dx_max = _wavelength_dx(board, settings)
     dx_min = target_dx(board, cropped, settings)
     minx, miny, maxx, maxy = cropped.region.bounds
-    margin = _air_margin(dx_min, dx_max, settings.max_ratio, settings.pml_cells + settings.air_cells)
+    margin = _air_margin(dx_min, dx_max, settings.max_ratio, _outer_cells(settings))
     x0, x1 = minx - margin, maxx + margin
     y0, y1 = miny - margin, maxy + margin
 
@@ -261,8 +267,16 @@ def _seed_zone(poly, dx_max: float, x_seeds, y_seeds, pitch: float = 0.0) -> Non
     _seed_edges(min(ys), max(ys), dx_max, pitch, y_seeds)
 
 
+def _outer_cells(settings: MeshSettings) -> int:
+    """Coarse cells outside the graded air. MUR is the skirt. PML adds the absorber."""
+    air = max(int(settings.air_cells), 0)
+    if settings.boundary == "mur":
+        return max(air, 1)
+    return max(int(settings.pml_cells), 0) + air
+
+
 def _air_margin(dx_min: float, dx_max: float, ratio: float, n_outer: int) -> float:
-    """Room to grade from the finest copper cell out to the wavelength cell, then PML."""
+    """Room to grade from the finest copper cell out to the wavelength cell, then the outer band."""
     ramp = sum(_ramp_widths(dx_min, dx_max, ratio, 1e9))
     return ramp + max(n_outer, 1) * dx_max + dx_max
 
@@ -296,7 +310,7 @@ def _z_lines(board: Board, settings: MeshSettings, dz_max: float) -> list[float]
             pts.append(z0 + dz * i)
     if not edge_dz:
         edge_dz = [dz_max]
-    n_outer = max(settings.pml_cells, 0) + max(settings.air_cells, 0)
+    n_outer = _outer_cells(settings)
     below = _air_points(zs[0], -1.0, edge_dz[0], dz_max, settings.max_ratio, n_outer)
     above = _air_points(pts[-1], 1.0, edge_dz[-1], dz_max, settings.max_ratio, n_outer)
     # Slabs stay on their own cell size. Grading a 0.1 mm prepreg's cell through

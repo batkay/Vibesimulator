@@ -9,6 +9,7 @@ dependencies = [
     "shapely>=2.0",
     "scikit-rf>=1.0",
     "matplotlib>=3.8",
+    "scipy>=1.11",
 ]
 
 [project.scripts]

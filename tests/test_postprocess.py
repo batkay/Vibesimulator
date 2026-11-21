@@ -3,15 +3,27 @@ import pytest
 import skrf as rf
 
 from pcb_simulator.project import DiffPair
-from pcb_simulator.sim.postprocess import (
-    differential_export,
-    differential_s,
-    mixed_mode_networks,
-    network,
-    tdr_impedance,
-    tdr_view_window,
-    write_csv,
-)
+from pcb_simulator.calc.csv_export import write_csv
+from pcb_simulator.calc.differential import differential_export, differential_s, mixed_mode_networks
+from pcb_simulator.calc.network import network
+from pcb_simulator.calc.s_parameters import s_column
+from pcb_simulator.calc.tdr import tdr_impedance, tdr_ohm_limits, tdr_view_window
+
+
+def test_s_column_is_reflected_over_incident():
+    incident = np.array([2 + 0j, 1e-20, 4 + 0j])
+    reflected = [
+        np.array([1 + 0j, 3 + 0j, 8 + 0j]),
+        np.array([0 + 1j, 5 + 0j, 0 + 4j]),
+    ]
+    column = s_column(reflected, incident)
+    assert column.shape == (3, 2)
+    assert column[0, 0] == pytest.approx(0.5)
+    assert column[0, 1] == pytest.approx(0.5j)
+    assert np.isnan(column[1, 0])
+    assert np.isnan(column[1, 1])
+    assert column[2, 0] == pytest.approx(2)
+    assert column[2, 1] == pytest.approx(1j)
 
 
 def test_s_to_z_roundtrip_and_flat_tdr():
@@ -54,6 +66,37 @@ def test_tdr_view_window_keeps_the_trace_after_a_large_launch():
     assert t0 <= 0.0
     assert t1 > 140e-12
     assert t1 < 1e-9
+
+
+def test_tdr_ohm_limits_keep_the_line_and_let_the_open_leave():
+    impedance = np.concatenate([np.full(80, 100.0), np.linspace(100.0, 20000.0, 20)])
+    lo, hi = tdr_ohm_limits(impedance)
+    assert lo < 100.0 < hi
+    assert hi < 400.0
+    assert hi < float(np.max(impedance))
+    low = np.concatenate([np.full(80, 20.0), np.full(20, 8000.0)])
+    low_lo, low_hi = tdr_ohm_limits(low)
+    assert low_lo < 20.0 < low_hi < 80.0
+    high = np.concatenate([np.full(80, 250.0), np.full(20, 20000.0)])
+    high_lo, high_hi = tdr_ohm_limits(high)
+    assert high_lo < 250.0 < high_hi < 800.0
+
+
+def test_tdr_view_window_stops_after_the_trace_when_the_tail_wanders():
+    dt = 6.25e-12
+    time_s = np.arange(-40, 800) * dt
+    impedance = np.full(time_s.shape, 50.0)
+    trace = (time_s >= 0.0) & (time_s < 0.30e-9)
+    impedance[trace] = 50.0 + np.sin(2 * np.pi * time_s[trace] / 0.05e-9)
+    step = (time_s >= 0.30e-9) & (time_s < 0.42e-9)
+    impedance[step] = 90.0
+    wander = time_s >= 0.42e-9
+    impedance[wander] = 70.0 + 40.0 * np.sin(2 * np.pi * (time_s[wander] - 0.42e-9) / 0.35e-9)
+    impedance[wander] += 25.0 * (time_s[wander] - 0.42e-9) / 1e-9
+    t0, t1 = tdr_view_window(time_s, impedance)
+    assert t0 <= 0.0
+    assert t1 > 0.42e-9
+    assert t1 < 0.6e-9
 
 
 def test_differential_match_and_open():
